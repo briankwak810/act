@@ -3,11 +3,13 @@ import numpy as np
 import os
 import pickle
 import argparse
+import collections
 import matplotlib.pyplot as plt
 from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
 import wandb
+import imageio
 WANDB_AVAILABLE = True
 
 from constants import DT
@@ -20,6 +22,16 @@ from policy import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
 
 from sim_env import BOX_POSE
+
+# LIBERO environment setup / stats loading
+from libero.dataset_loader import load_norm_stats as load_libero_norm_stats
+
+# LIBERO environment setup
+from libero.libero import benchmark
+from libero.libero.envs import OffScreenRenderEnv
+from libero.libero.envs.env_wrapper import ControlEnv
+from libero.libero import get_libero_path
+import pathlib
 
 import IPython
 e = IPython.embed
@@ -336,7 +348,28 @@ def eval_bc_libero(config, ckpt_name, save_episode=True):
     max_timesteps = config['episode_len']
     task_name = config['task_name']
     temporal_agg = config['temporal_agg']
-    onscreen_cam = 'angle'
+    # Helper function to convert quaternion to axis-angle (from libero/main.py)
+    def _quat2axisangle(quat):
+        """Convert quaternion to axis-angle representation."""
+        import math
+        # clip quaternion
+        if quat[3] > 1.0:
+            quat[3] = 1.0
+        elif quat[3] < -1.0:
+            quat[3] = -1.0
+
+        den = np.sqrt(1.0 - quat[3] * quat[3])
+        if math.isclose(den, 0.0):
+            # This is (close to) a zero degree rotation, immediately return
+            return np.zeros(3)
+
+        return (quat[:3] * 2.0 * math.acos(quat[3])) / den
+    
+    # Create a dummy timestep class for LIBERO compatibility
+    class TimeStep:
+        def __init__(self, observation, reward=0):
+            self.observation = observation
+            self.reward = reward
 
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
@@ -346,23 +379,100 @@ def eval_bc_libero(config, ckpt_name, save_episode=True):
     policy.cuda()
     policy.eval()
     print(f'Loaded: {ckpt_path}')
-    stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
-    with open(stats_path, 'rb') as f:
-        stats = pickle.load(f)
 
-    pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
-    post_process = lambda a: a * stats['action_std'] + stats['action_mean']
+    # Load normalization statistics saved in LeRobot / LIBERO format
+    # Expect a directory containing "norm_stats.json", e.g. "libero/norm_stats"
+    norm_stats_dir = config.get('norm_stats_dir', 'libero/norm_stats')
+    norm_stats = load_libero_norm_stats(norm_stats_dir)
 
-    # load environment
-    if real_robot:
-        from aloha_scripts.robot_utils import move_grippers # requires aloha
-        from aloha_scripts.real_env import make_real_env # requires aloha
-        env = make_real_env(init_node=True)
-        env_max_reward = 0
+    # Map LIBERO norm stats to the format expected by the rest of this file
+    # norm_stats["qpos"] and norm_stats["actions"] are NormStats(mean, std, ...)
+    # Note: The raw dataset state might be 8D, but after PadStatesAndActions(state_dim=7)
+    # during training, it becomes 7D. We need to truncate to match what the model was trained on.
+    qpos_stats = norm_stats["qpos"]
+    action_stats = norm_stats["actions"]
+    
+    # Truncate qpos stats to state_dim (7) to match the state we construct during evaluation
+    # The raw dataset state is 8D, but the model sees 7D after padding/truncation
+    qpos_mean = qpos_stats.mean[:state_dim] if len(qpos_stats.mean) > state_dim else qpos_stats.mean
+    qpos_std = qpos_stats.std[:state_dim] if len(qpos_stats.std) > state_dim else qpos_stats.std
+    
+    stats = {
+        "qpos_mean": qpos_mean,
+        "qpos_std": qpos_std,
+        "action_mean": action_stats.mean,
+        "action_std": action_stats.std,
+    }
+
+    pre_process = lambda s_qpos: (s_qpos - stats["qpos_mean"]) / stats["qpos_std"]
+    post_process = lambda a: a * stats["action_std"] + stats["action_mean"]
+
+    
+    # Get task information from config
+    task_names = config.get('task_names')
+    task_indices = config.get('task_indices')
+    
+    # Convert to list if needed
+    if task_names is not None and isinstance(task_names, str):
+        task_names = [task_names]
+    if task_indices is not None and not isinstance(task_indices, (list, tuple)):
+        task_indices = [task_indices] if task_indices != 0 else None
+    
+    # Initialize LIBERO benchmark (default to libero_spatial if not specified)
+    task_suite_name = "libero_goal"  # Could be made configurable
+    benchmark_dict = benchmark.get_benchmark_dict()
+    task_suite = benchmark_dict[task_suite_name]()
+    
+    # Get the task - use task_indices if provided, otherwise use task_names
+    if task_indices is not None and len(task_indices) > 0:
+        task_id = task_indices[0]
+    elif task_names is not None and len(task_names) > 0:
+        # Find task by name
+        task_id = None
+        for i in range(task_suite.n_tasks):
+            if task_suite.get_task(i).language == task_names[0]:
+                task_id = i
+                break
+        if task_id is None:
+            raise ValueError(f"Task name '{task_names[0]}' not found in task suite")
     else:
-        from sim_env import make_sim_env
-        env = make_sim_env(task_name)
-        env_max_reward = env.task.max_reward
+        task_id = 0  # Default to first task
+    
+    task = task_suite.get_task(task_id)
+    task_description = task.language
+    print(f"Evaluating LIBERO task {task_id}: {task_description}")
+    
+    # Get initial states
+    # PyTorch 2.6+ requires weights_only=False for loading numpy arrays
+    # Temporarily monkey-patch torch.load to handle this
+    original_torch_load = torch.load
+    def patched_torch_load(*args, **kwargs):
+        if 'weights_only' not in kwargs:
+            kwargs['weights_only'] = False
+        return original_torch_load(*args, **kwargs)
+    
+    try:
+        torch.load = patched_torch_load
+        initial_states = task_suite.get_task_init_states(task_id)
+    finally:
+        torch.load = original_torch_load
+    
+    # Create environment
+    LIBERO_ENV_RESOLUTION = 256
+    task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
+    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": LIBERO_ENV_RESOLUTION, "camera_widths": LIBERO_ENV_RESOLUTION}
+    
+    if onscreen_render:
+        env_args["has_renderer"] = True
+        env_args["has_offscreen_renderer"] = True
+        env = ControlEnv(**env_args)
+    else:
+        env = OffScreenRenderEnv(**env_args)
+    
+    env.seed(1000)
+    env_max_reward = 1  # LIBERO tasks are binary success/failure
+    LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
+    num_steps_wait = 10  # Wait for objects to stabilize
 
     query_frequency = policy_config['num_queries']
     if temporal_agg:
@@ -371,24 +481,16 @@ def eval_bc_libero(config, ckpt_name, save_episode=True):
 
     max_timesteps = int(max_timesteps * 1) # may increase for real-world tasks
 
+
     num_rollouts = 50
     episode_returns = []
     highest_rewards = []
     for rollout_id in range(num_rollouts):
-        rollout_id += 0
-        ### set task
-        if 'sim_transfer_cube' in task_name:
-            BOX_POSE[0] = sample_box_pose() # used in sim reset
-        elif 'sim_insertion' in task_name:
-            BOX_POSE[0] = np.concatenate(sample_insertion_pose()) # used in sim reset
-
-        ts = env.reset()
-
-        ### onscreen render
-        if onscreen_render:
-            ax = plt.subplot()
-            plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
-            plt.ion()
+        # LIBERO: reset and set initial state
+        env.reset()
+        initial_state_idx = rollout_id % len(initial_states)
+        obs = env.set_init_state(initial_states[initial_state_idx])
+        ts = TimeStep(obs, 0)
 
         ### evaluation loop
         if temporal_agg:
@@ -399,74 +501,182 @@ def eval_bc_libero(config, ckpt_name, save_episode=True):
         qpos_list = []
         target_qpos_list = []
         rewards = []
+        action_plan = collections.deque()
+        
         with torch.inference_mode():
-            for t in range(max_timesteps):
-                ### update onscreen render and wait for DT
-                if onscreen_render:
-                    image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
-                    plt_img.set_data(image)
-                    plt.pause(DT)
+            for t in range(max_timesteps + num_steps_wait):
+                # LIBERO: wait for objects to stabilize
+                if t < num_steps_wait:
+                    if onscreen_render and hasattr(env, 'env') and hasattr(env.env, 'render'):
+                        env.env.render()
+                    obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                    ts = TimeStep(obs, reward)
+                    continue
 
-                ### process previous timestep to get qpos and image_list
+                # Effective timestep index excluding the initial wait steps
+                t_eff = t - num_steps_wait
+                if t_eff >= max_timesteps:
+                    break
+
+                ### process observations
                 obs = ts.observation
-                if 'images' in obs:
-                    image_list.append(obs['images'])
-                else:
-                    image_list.append({'main': obs['image']})
-                qpos_numpy = np.array(obs['qpos'])
+                # Get and preprocess LIBERO images
+                # IMPORTANT: rotate 180 degrees to match train preprocessing
+                img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                
+                # Resize and convert images for model input (similar to eval_libero)
+                resize_size = 224
+                try:
+                    # Try to use openpi_client image_tools if available (like eval_libero)
+                    from openpi_client import image_tools
+                    img_processed = image_tools.convert_to_uint8(
+                        image_tools.resize_with_pad(img, resize_size, resize_size)
+                    )
+                    wrist_img_processed = image_tools.convert_to_uint8(
+                        image_tools.resize_with_pad(wrist_img, resize_size, resize_size)
+                    )
+                except (ImportError, AttributeError, NameError):
+                    # Fallback to cv2 or PIL
+                    try:
+                        import cv2
+                        img_resized = cv2.resize(img, (resize_size, resize_size))
+                        wrist_img_resized = cv2.resize(wrist_img, (resize_size, resize_size))
+                    except ImportError:
+                        from PIL import Image
+                        img_resized = np.array(Image.fromarray(img).resize((resize_size, resize_size)))
+                        wrist_img_resized = np.array(Image.fromarray(wrist_img).resize((resize_size, resize_size)))
+                    
+                    # Convert to uint8
+                    if img_resized.dtype != np.uint8:
+                        img_processed = (img_resized * 255).astype(np.uint8) if img_resized.max() <= 1.0 else img_resized.astype(np.uint8)
+                    else:
+                        img_processed = img_resized
+                    if wrist_img_resized.dtype != np.uint8:
+                        wrist_img_processed = (wrist_img_resized * 255).astype(np.uint8) if wrist_img_resized.max() <= 1.0 else wrist_img_resized.astype(np.uint8)
+                    else:
+                        wrist_img_processed = wrist_img_resized
+                
+                # Save preprocessed image for replay video (like eval_libero - just agentview)
+                image_list.append(img_processed)
+                
+                # Use processed images for model input
+                img_resized = img_processed
+                wrist_img_resized = wrist_img_processed
+                
+                # Convert to tensor format: [H, W, C] -> [C, H, W]
+                img_tensor = rearrange(torch.from_numpy(img_resized).float() / 255.0, "h w c -> c h w")
+                wrist_img_tensor = rearrange(torch.from_numpy(wrist_img_resized).float() / 255.0, "h w c -> c h w")
+                
+                # Stack images: [2, C, H, W] where 2 is for agentview and wrist camera
+                curr_image = torch.stack([img_tensor, wrist_img_tensor], dim=0)  # [2, C, H, W]
+                curr_image = curr_image.cuda().unsqueeze(0)  # [1, 2, C, H, W]
+                
+                # Get state (qpos) - concatenate eef_pos, axis-angle quat, and gripper
+                state = np.concatenate(
+                    (
+                        obs["robot0_eef_pos"],
+                        _quat2axisangle(obs["robot0_eef_quat"]),
+                        obs["robot0_gripper_qpos"],
+                    )
+                )
+                
+                # Ensure state matches expected dimension
+                if len(state) != state_dim:
+                    if len(state) > state_dim:
+                        state = state[:state_dim]
+                    else:
+                        state = np.pad(state, (0, state_dim - len(state)), mode="constant")
+                
+                qpos_numpy = state
+                
                 qpos = pre_process(qpos_numpy)
                 qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
-                qpos_history[:, t] = qpos
-                curr_image = get_image(ts, camera_names)
+                qpos_history[:, t_eff] = qpos
 
-                ### query policy
+                ### query policy (LIBERO environment only)
                 if config['policy_class'] == "ACT":
-                    if t % query_frequency == 0:
-                        all_actions = policy(qpos, curr_image)
-                    if temporal_agg:
-                        all_time_actions[[t], t:t+num_queries] = all_actions
-                        actions_for_curr_step = all_time_actions[:, t]
-                        actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
-                        actions_for_curr_step = actions_for_curr_step[actions_populated]
-                        k = 0.01
-                        exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
-                        exp_weights = exp_weights / exp_weights.sum()
-                        exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
-                        raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
+                    # Query new chunk when action plan is empty or at the specified frequency
+                    if (not action_plan) or (t_eff % query_frequency == 0):
+                        all_actions = policy(qpos, curr_image).squeeze(0)  # [chunk_size, action_dim]
+                        
+                        if temporal_agg:
+                            # Store this chunk for temporal aggregation
+                            all_time_actions[t_eff:t_eff+num_queries, t_eff] = all_actions
+                        
+                        # Enqueue up to query_frequency actions from this chunk
+                        action_plan.extend(all_actions[:min(query_frequency, len(all_actions))])
+                    
+                    # Pop the next action from the plan
+                    if action_plan:
+                        raw_action = action_plan.popleft()
+                        
+                        # Temporal aggregation over past chunks
+                        if temporal_agg and t_eff > 0:
+                            actions_for_curr_step = all_time_actions[:, t_eff]
+                            actions_populated = torch.all(actions_for_curr_step != 0, dim=1)
+                            actions_for_curr_step = actions_for_curr_step[actions_populated]
+                            if len(actions_for_curr_step) > 0:
+                                k = 0.01
+                                exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
+                                exp_weights = exp_weights / exp_weights.sum()
+                                exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+                                raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
                     else:
-                        raw_action = all_actions[:, t % query_frequency]
+                        # Fallback: use zeros if plan is empty
+                        raw_action = torch.zeros(state_dim).cuda()
+
                 elif config['policy_class'] == "CNNMLP":
                     raw_action = policy(qpos, curr_image)
                 else:
                     raise NotImplementedError
 
                 ### post-process actions
-                raw_action = raw_action.squeeze(0).cpu().numpy()
+                if isinstance(raw_action, torch.Tensor):
+                    raw_action = raw_action.squeeze().cpu().numpy()
+                else:
+                    raw_action = raw_action.squeeze()
                 action = post_process(raw_action)
-                target_qpos = action
+                
+                # Ensure action is correct dimension for LIBERO (7D: 6D arm + 1D gripper)
+                if len(action) != 7:
+                    if len(action) > 7:
+                        action = action[:7]
+                    else:
+                        action = np.pad(action, (0, 7 - len(action)), mode="constant")
+                target_qpos = action.tolist()
 
                 ### step the environment
-                ts = env.step(target_qpos)
+                if onscreen_render and hasattr(env, 'env') and hasattr(env.env, 'render'):
+                    env.env.render()
+                obs, reward, done, info = env.step(target_qpos)
+                ts = TimeStep(obs, reward)
 
                 ### for visualization
                 qpos_list.append(qpos_numpy)
                 target_qpos_list.append(target_qpos)
                 rewards.append(ts.reward)
-
-            plt.close()
-        if real_robot:
-            move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2, move_time=0.5)  # open
-            pass
-
+                
+                # LIBERO: check if done
+                if done:
+                    break
+        
         rewards = np.array(rewards)
         episode_return = np.sum(rewards[rewards!=None])
         episode_returns.append(episode_return)
-        episode_highest_reward = np.max(rewards)
+        episode_highest_reward = np.max(rewards) if len(rewards) > 0 else 0
         highest_rewards.append(episode_highest_reward)
         print(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
 
         if save_episode:
-            save_videos(image_list, DT, video_path=os.path.join(ckpt_dir, f'video{rollout_id}.mp4'))
+            # Save video similar to eval_libero
+            suffix = "success" if episode_highest_reward == env_max_reward else "failure"
+            video_path = os.path.join(ckpt_dir, f'results', f'video{rollout_id}_{suffix}.mp4')
+            imageio.mimwrite(
+                video_path,
+                [np.asarray(x) for x in image_list],
+                fps=10,
+            )
 
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
     avg_return = np.mean(episode_returns)
