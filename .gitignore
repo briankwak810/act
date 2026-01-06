@@ -9,6 +9,7 @@ _wandb
 
 third_party/
 libero/.venv
+libero/ckpts/
 
 **/.DS_Store
 
