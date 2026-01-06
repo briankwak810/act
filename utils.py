@@ -2,7 +2,13 @@ import numpy as np
 import torch
 import os
 import h5py
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, random_split
+from libero.dataset_loader import (
+    load_norm_stats, create_libero_dataloader, create_libero_dataset, 
+    transform_libero_dataset, compute_norm_stats, _collate_fn,
+    Normalize, PadStatesAndActions, CreateIsPad, TransformedDataset, save_norm_stats
+)
+import pathlib
 
 import IPython
 e = IPython.embed
@@ -127,6 +133,138 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim
 
+def load_data_from_lerobot(config, num_episodes, camera_names, batch_size_train, batch_size_val):
+    print(f'\nLoading data from Lerobot\n')
+    norm_stats_dir = config['norm_stats_dir']
+    norm_stats = None
+    if norm_stats_dir:
+        norm_stats_path = pathlib.Path(norm_stats_dir)
+        if norm_stats_path.exists() and (norm_stats_path / "norm_stats.json").exists():
+            print(f"Loading normalization stats from {norm_stats_path}...")
+            norm_stats = load_norm_stats(norm_stats_path)
+            print("  ✅ Normalization stats loaded")
+        else:
+            print(f"  ⚠️ Norm stats not found at {norm_stats_path}, will compute on the fly")
+
+    # Convert task_names to list if it's a string
+    task_names = config.get('task_names')
+    if task_names is not None and isinstance(task_names, str):
+        task_names = [task_names]
+    
+    task_indices = config.get('task_indices')
+    if task_indices is not None and not isinstance(task_indices, (list, tuple)):
+        task_indices = [task_indices] if task_indices != 0 else None
+
+    # Get action_horizon from chunk_size (num_queries) to match model expectations
+    # 32 intended
+    # action_horizon = config.get('policy_config', {}).get('num_queries', 100)
+    # if action_horizon is None:
+    #     action_horizon = 100  # default fallback
+
+    # Create dataset
+    print("\nCreating dataset...")
+    try:
+        base_dataset = create_libero_dataset(
+            repo_id="physical-intelligence/libero",
+            action_horizon=32,
+            task_indices=task_indices,
+            task_names=task_names,
+        )
+        print(f"  ✅ Base dataset created: {len(base_dataset)} samples")
+    except Exception as e:
+        print(f"  ❌ Failed to create dataset: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    # Compute norm stats if not provided
+    if norm_stats is None:
+        print("\nComputing normalization statistics...")
+        try:
+            norm_stats, preprocessed_dataset = compute_norm_stats(
+                base_dataset,
+                camera_names=config['camera_names'],
+                batch_size=batch_size_train,
+                num_workers=4,
+                image_resolution=[224, 224],
+            )
+            print("  ✅ Normalization statistics computed")
+            
+            # Save norm stats if directory is provided
+            if norm_stats_dir:
+                norm_stats_path = pathlib.Path(norm_stats_dir)
+                if norm_stats_path.exists():
+                    print(f"Saving norm stats to {norm_stats_path}...")
+                    save_norm_stats(norm_stats_path, norm_stats)
+            
+            # Transform dataset
+            remaining_transforms = []
+            remaining_transforms.append(Normalize(norm_stats, use_quantiles=False))
+            remaining_transforms.append(PadStatesAndActions(config['state_dim']))
+            remaining_transforms.append(CreateIsPad())
+            dataset = TransformedDataset(preprocessed_dataset, remaining_transforms)
+        except Exception as e:
+            print(f"  ❌ Failed to compute norm stats: {e}")
+            import traceback
+            traceback.print_exc()
+            return 1
+    else:
+        # Transform dataset from scratch if norm_stats already provided
+        print("\nTransforming dataset with provided norm stats...")
+        try:
+            dataset = transform_libero_dataset(
+                base_dataset,
+                model_action_dim=config['state_dim'],
+                image_resolution=[224, 224],
+                camera_names=config['camera_names'],
+                norm_stats=norm_stats,
+                use_quantile_norm=False,
+            )
+            print("  ✅ Dataset transformed")
+        except Exception as e:
+            print(f"  ❌ Failed to transform dataset: {e}")
+            import traceback
+            traceback.print_exc()
+            return 1
+
+    # Split dataset into train and validation
+    print("\nSplitting dataset into train/validation...")
+    train_ratio = 0.8
+    dataset_size = len(dataset)
+    train_size = int(train_ratio * dataset_size)
+    val_size = dataset_size - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    print(f"  ✅ Dataset split: {train_size} train, {val_size} validation samples")
+
+    # Create dataloaders
+    print("\nCreating dataloaders...")
+    try:
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=batch_size_train,
+            shuffle=True,
+            num_workers=0,
+            collate_fn=_collate_fn,
+            drop_last=True,
+        )
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=batch_size_val,
+            shuffle=True,
+            num_workers=0,
+            collate_fn=_collate_fn,
+            drop_last=True,
+        )
+        print(f"  ✅ Dataloaders created successfully")
+        print(f"  Train dataset size: {len(train_dataset)} samples")
+        print(f"  Val dataset size: {len(val_dataset)} samples")
+    except Exception as e:
+        print(f"  ❌ Failed to create dataloaders: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    return train_dataloader, val_dataloader
 
 ### env utils
 

@@ -30,6 +30,13 @@ SIM_TASK_CONFIGS = {
         'episode_len': 500,
         'camera_names': ['top']
     },
+    
+    'sim_libero_put_bowl_on_top_of_cabinet': {
+        'dataset_dir': '',
+        'num_episodes': 50,
+        'episode_len': 300,
+        'camera_names': ['top', 'wrist']
+    },
 }
 
 ### Simulation envs fixed constants

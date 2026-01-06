@@ -7,6 +7,9 @@ data_local
 .vscode
 _wandb
 
+third_party/
+libero/.venv
+
 **/.DS_Store
 
 fuse.cfg
