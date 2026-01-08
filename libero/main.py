@@ -306,7 +306,19 @@ def test_libero_env(args: TestEnvArgs) -> None:
     logging.info(f"Testing task {args.task_id}: {task_description}")
     
     # Get default LIBERO initial states
-    initial_states = task_suite.get_task_init_states(args.task_id)
+    # PyTorch 2.6+ requires weights_only=False for loading numpy arrays
+    # Temporarily monkey-patch torch.load to handle this
+    original_torch_load = torch.load
+    def patched_torch_load(*args, **kwargs):
+        if 'weights_only' not in kwargs:
+            kwargs['weights_only'] = False
+        return original_torch_load(*args, **kwargs)
+    
+    try:
+        torch.load = patched_torch_load
+        initial_states = task_suite.get_task_init_states(args.task_id)
+    finally:
+        torch.load = original_torch_load
     logging.info(f"Number of initial states available: {len(initial_states)}")
     
     # Create output directory
@@ -563,7 +575,19 @@ def eval_bc_on_libero(args: EvalBCArgs) -> None:
         task = task_suite.get_task(task_id)
         
         # Get default LIBERO initial states
-        initial_states = task_suite.get_task_init_states(task_id)
+        # PyTorch 2.6+ requires weights_only=False for loading numpy arrays
+        # Temporarily monkey-patch torch.load to handle this
+        original_torch_load = torch.load
+        def patched_torch_load(*args, **kwargs):
+            if 'weights_only' not in kwargs:
+                kwargs['weights_only'] = False
+            return original_torch_load(*args, **kwargs)
+        
+        try:
+            torch.load = patched_torch_load
+            initial_states = task_suite.get_task_init_states(task_id)
+        finally:
+            torch.load = original_torch_load
         
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(

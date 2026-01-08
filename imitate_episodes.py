@@ -109,10 +109,12 @@ def main(args):
     }
 
     if is_eval:
-        ckpt_names = [f'policy_best.ckpt']
+        enable_teleop = args.get('enable_teleop', False)
+        # ckpt_names = [f'policy_best.ckpt']
+        ckpt_names = [f'policy_epoch_0_seed_0.ckpt']
         results = []
         for ckpt_name in ckpt_names:
-            success_rate, avg_return = eval_bc_libero(config, ckpt_name, save_episode=True)
+            success_rate, avg_return = eval_bc_libero(config, ckpt_name, save_episode=True, enable_teleop=enable_teleop)
             results.append([ckpt_name, success_rate, avg_return])
 
         for ckpt_name, success_rate, avg_return in results:
@@ -336,7 +338,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
     return success_rate, avg_return
 
-def eval_bc_libero(config, ckpt_name, save_episode=True):
+def eval_bc_libero(config, ckpt_name, save_episode=True, enable_teleop=False):
     set_seed(1000)
     ckpt_dir = config['ckpt_dir']
     state_dim = config['state_dim']
@@ -348,6 +350,18 @@ def eval_bc_libero(config, ckpt_name, save_episode=True):
     max_timesteps = config['episode_len']
     task_name = config['task_name']
     temporal_agg = config['temporal_agg']
+    
+    # Initialize teleoperation if enabled
+    teleop = None
+    if enable_teleop and onscreen_render:
+        try:
+            from libero_teleop import create_teleop
+            teleop = create_teleop(use_threading=True)
+            teleop.start()
+        except Exception as e:
+            print(f"Warning: Could not initialize teleoperation: {e}")
+            print("Continuing without teleoperation...")
+            teleop = None
     # Helper function to convert quaternion to axis-angle (from libero/main.py)
     def _quat2axisangle(quat):
         """Convert quaternion to axis-angle representation."""
@@ -507,7 +521,7 @@ def eval_bc_libero(config, ckpt_name, save_episode=True):
             for t in range(max_timesteps + num_steps_wait):
                 # LIBERO: wait for objects to stabilize
                 if t < num_steps_wait:
-                    if onscreen_render and hasattr(env, 'env') and hasattr(env.env, 'render'):
+                    if onscreen_render : #and hasattr(env, 'env') and hasattr(env.env, 'render'):
                         env.env.render()
                     obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
                     ts = TimeStep(obs, reward)
@@ -594,60 +608,74 @@ def eval_bc_libero(config, ckpt_name, save_episode=True):
                 qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
                 qpos_history[:, t_eff] = qpos
 
-                ### query policy (LIBERO environment only)
-                if config['policy_class'] == "ACT":
-                    # Query new chunk when action plan is empty or at the specified frequency
-                    if (not action_plan) or (t_eff % query_frequency == 0):
-                        all_actions = policy(qpos, curr_image).squeeze(0)  # [chunk_size, action_dim]
+                ### Check for teleoperation intervention
+                use_teleop = False
+                if teleop is not None and teleop.is_active():
+                    use_teleop = True
+                    # Get teleoperation action (relative to current state)
+                    target_qpos = teleop.get_action(qpos_numpy)
+                    # Check if teleop wants to exit
+                    if teleop.exit_requested:
+                        teleop.stop()
+                        use_teleop = False
+                        print("Teleoperation mode exited. Resuming policy control.")
+
+                ### query policy (LIBERO environment only) - skip if using teleop
+                if not use_teleop:
+                    if config['policy_class'] == "ACT":
+                        # Query new chunk when action plan is empty or at the specified frequency
+                        if (not action_plan) or (t_eff % query_frequency == 0):
+                            all_actions = policy(qpos, curr_image).squeeze(0)  # [chunk_size, action_dim]
+                            
+                            if temporal_agg:
+                                # Store this chunk for temporal aggregation
+                                all_time_actions[t_eff:t_eff+num_queries, t_eff] = all_actions
+                            
+                            # Enqueue up to query_frequency actions from this chunk
+                            action_plan.extend(all_actions[:min(query_frequency, len(all_actions))])
                         
-                        if temporal_agg:
-                            # Store this chunk for temporal aggregation
-                            all_time_actions[t_eff:t_eff+num_queries, t_eff] = all_actions
-                        
-                        # Enqueue up to query_frequency actions from this chunk
-                        action_plan.extend(all_actions[:min(query_frequency, len(all_actions))])
+                        # Pop the next action from the plan
+                        if action_plan:
+                            raw_action = action_plan.popleft()
+                            
+                            # Temporal aggregation over past chunks
+                            if temporal_agg and t_eff > 0:
+                                actions_for_curr_step = all_time_actions[:, t_eff]
+                                actions_populated = torch.all(actions_for_curr_step != 0, dim=1)
+                                actions_for_curr_step = actions_for_curr_step[actions_populated]
+                                if len(actions_for_curr_step) > 0:
+                                    k = 0.01
+                                    exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
+                                    exp_weights = exp_weights / exp_weights.sum()
+                                    exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+                                    raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
+                        else:
+                            # Fallback: use zeros if plan is empty
+                            raw_action = torch.zeros(state_dim).cuda()
+
+                    elif config['policy_class'] == "CNNMLP":
+                        raw_action = policy(qpos, curr_image)
+                    else:
+                        raise NotImplementedError
+
+                    ### post-process actions
+                    if isinstance(raw_action, torch.Tensor):
+                        raw_action = raw_action.squeeze().cpu().numpy()
+                    else:
+                        raw_action = raw_action.squeeze()
+                    action = post_process(raw_action)
                     
-                    # Pop the next action from the plan
-                    if action_plan:
-                        raw_action = action_plan.popleft()
-                        
-                        # Temporal aggregation over past chunks
-                        if temporal_agg and t_eff > 0:
-                            actions_for_curr_step = all_time_actions[:, t_eff]
-                            actions_populated = torch.all(actions_for_curr_step != 0, dim=1)
-                            actions_for_curr_step = actions_for_curr_step[actions_populated]
-                            if len(actions_for_curr_step) > 0:
-                                k = 0.01
-                                exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
-                                exp_weights = exp_weights / exp_weights.sum()
-                                exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
-                                raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
-                    else:
-                        # Fallback: use zeros if plan is empty
-                        raw_action = torch.zeros(state_dim).cuda()
-
-                elif config['policy_class'] == "CNNMLP":
-                    raw_action = policy(qpos, curr_image)
-                else:
-                    raise NotImplementedError
-
-                ### post-process actions
-                if isinstance(raw_action, torch.Tensor):
-                    raw_action = raw_action.squeeze().cpu().numpy()
-                else:
-                    raw_action = raw_action.squeeze()
-                action = post_process(raw_action)
-                
-                # Ensure action is correct dimension for LIBERO (7D: 6D arm + 1D gripper)
-                if len(action) != 7:
-                    if len(action) > 7:
-                        action = action[:7]
-                    else:
-                        action = np.pad(action, (0, 7 - len(action)), mode="constant")
-                target_qpos = action.tolist()
+                    # Ensure action is correct dimension for LIBERO (7D: 6D arm + 1D gripper)
+                    if len(action) != 7:
+                        if len(action) > 7:
+                            action = action[:7]
+                        else:
+                            action = np.pad(action, (0, 7 - len(action)), mode="constant")
+                    target_qpos = action.tolist()
+                # else: target_qpos already set from teleop above
 
                 ### step the environment
-                if onscreen_render and hasattr(env, 'env') and hasattr(env.env, 'render'):
+                if onscreen_render : #and hasattr(env, 'env') and hasattr(env.env, 'render'):
                     env.env.render()
                 obs, reward, done, info = env.step(target_qpos)
                 ts = TimeStep(obs, reward)
@@ -695,6 +723,10 @@ def eval_bc_libero(config, ckpt_name, save_episode=True):
         f.write(repr(episode_returns))
         f.write('\n\n')
         f.write(repr(highest_rewards))
+
+    # Cleanup teleoperation
+    if teleop is not None:
+        teleop.cleanup()
 
     return success_rate, avg_return
 
@@ -962,4 +994,5 @@ if __name__ == '__main__':
     parser.add_argument('--temporal_agg', action='store_true')
     parser.add_argument('--task_indices', default=0,action='store', type=int, help='task_indices', required=False)
     parser.add_argument('--task_names', default="put the bowl on top of the cabinet", action='store', type=str, help='task_names', required=False)
+    parser.add_argument('--enable_teleop', action='store_true', help='Enable keyboard teleoperation for human intervention during evaluation')
     main(vars(parser.parse_args()))
